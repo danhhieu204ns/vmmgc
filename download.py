@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Standalone best-effort downloader; Python 3.11+.
+"""Standalone best-effort downloader; Python 3.10+.
 
 Install: python -m pip install yt-dlp==2026.8.19 requests Pillow
 Run:     python download.py --limit 5 --workers 2
+Parallel: --workers 4 --provider-workers 2 (bounded transfers per provider).
 Retry:   python download.py --retry-failed
 Pacing:  --delay sets the minimum interval between requests per provider.
 Preview: python download.py --dry-run
@@ -38,7 +39,10 @@ KINDS = ('audio', 'lyrics', 'cover')
 
 def sha256(path):
     with path.open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+        return digest.hexdigest()
 
 
 def atomic(path, text):
@@ -156,9 +160,22 @@ def retry_after(response):
             return None
 
 
+def error_retry_after(exc):
+    """Find Retry-After on HTTP errors wrapped by an extractor/downloader."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        response = getattr(exc, 'response', None)
+        seconds = retry_after(response if response is not None else exc)
+        if seconds is not None:
+            return seconds
+        exc = getattr(exc, 'cause', None) or getattr(exc, '__cause__', None) or getattr(exc, '__context__', None)
+    return None
+
+
 class RequestGate:
     """Shared provider pacing and cooldown; monotonic deadlines survive clock changes."""
-    def __init__(self, interval):
+    def __init__(self, interval, concurrency=2):
         self.interval = interval
         self.base_interval = interval
         self.successes = 0
@@ -167,7 +184,7 @@ class RequestGate:
         self.next_request = 0.0
         self.blocked_until = 0.0
         self.lock = threading.Lock()
-        self.source_lock = threading.Lock()
+        self.source_lock = threading.BoundedSemaphore(concurrency)
 
     def wait(self):
         while True:
@@ -197,7 +214,7 @@ class RequestGate:
 
 class DownloadRuntime:
     def __init__(self, args):
-        self.gates = {kind: RequestGate(args.delay) for kind in ('zing', 'youtube')}
+        self.gates = {kind: RequestGate(args.delay, args.provider_workers) for kind in ('zing', 'youtube')}
         self.local = threading.local()
         self.sessions = []
         self.lock = threading.Lock()
@@ -246,9 +263,9 @@ class WebSource:
                     gate.success()
                     return response
                 except Exception as exc:
-                    if http_status(exc) == 429:
-                        response = getattr(exc, 'response', None)
-                        seconds = retry_after(response if response is not None else exc)
+                    status = http_status(exc)
+                    seconds = error_retry_after(exc)
+                    if status == 429 or (status == 503 and seconds is not None):
                         gate.cooldown(seconds if seconds is not None else backoff(0))
                     raise
 
@@ -291,8 +308,8 @@ class WebSource:
             try:
                 self.gate.wait()
                 with self.session.get(url, timeout=(10, self.args.timeout), stream=True) as response:
-                    if response.status_code == 429:
-                        seconds = retry_after(response)
+                    seconds = retry_after(response)
+                    if response.status_code == 429 or (response.status_code == 503 and seconds is not None):
                         self.gate.cooldown(seconds if seconds is not None else backoff(attempt))
                     response.raise_for_status()
                     with path.open('wb') as stream:
@@ -312,7 +329,9 @@ class WebSource:
                 transient = isinstance(exc, (requests.Timeout, requests.ConnectionError)) or status in (408, 429, 500, 502, 503, 504)
                 if attempt == self.args.retries or not transient:
                     raise
-                if status != 429:
+                # Cooldown is shared with other workers; wait once at the next
+                # gate admission instead of sleeping again in this worker.
+                if status != 429 and not (status == 503 and error_retry_after(exc) is not None):
                     time.sleep(backoff(attempt))
 
     def cover(self):
@@ -380,7 +399,7 @@ def rebuild_record(original, out, args, previous=None, backend=WebSource):
         started = time.monotonic()
         gate = args.runtime.gates[provider(url)]
         try:
-            # One active source per provider; independent providers can overlap.
+            # Bound active transfers while pacing every request across workers.
             with gate.source_lock, backend(url, work, args) as source:
                 for kind in KINDS:
                     if kind not in pending:
@@ -476,15 +495,16 @@ def main():
     parser.add_argument('--limit', type=int, help='Process first N selected rows; omit for all')
     parser.add_argument('--record-id', action='append', help='Select record ID; repeatable')
     parser.add_argument('--delay', type=float, default=1.0, help='Minimum seconds between requests per provider (including media)')
-    parser.add_argument('--workers', type=int, default=2, help='Concurrent records; at most one active source per provider')
+    parser.add_argument('--workers', type=int, default=4, help='Concurrent records (default: 4)')
+    parser.add_argument('--provider-workers', type=int, default=2, help='Maximum active sources per provider (default: 2; use 1 for serial downloads)')
     parser.add_argument('--timeout', type=int, default=30)
     parser.add_argument('--retries', type=int, default=2)
     parser.add_argument('--cookies', type=Path, help='Optional yt-dlp Netscape cookie file')
     parser.add_argument('--retry-failed', action='store_true', help='Retry saved records with missing asset types')
     parser.add_argument('--dry-run', action='store_true', help='Validate manifest and show plan, without writes/network')
     args = parser.parse_args()
-    if args.workers < 1 or not math.isfinite(args.delay) or args.delay < 0 or args.timeout < 1 or args.retries < 0 or (args.limit is not None and args.limit < 1):
-        parser.error('Invalid workers, delay, timeout, retries or limit')
+    if args.workers < 1 or args.provider_workers < 1 or not math.isfinite(args.delay) or args.delay < 0 or args.timeout < 1 or args.retries < 0 or (args.limit is not None and args.limit < 1):
+        parser.error('Invalid workers, provider-workers, delay, timeout, retries or limit')
     manifest, out = args.manifest.resolve(), args.output.resolve()
     if manifest.is_relative_to(out):
         parser.error('Output must be separate from the input dataset')
